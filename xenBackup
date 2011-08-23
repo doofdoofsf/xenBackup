@@ -1,0 +1,261 @@
+#!/bin/bash
+#
+#   Copyright John Quinn, 2008
+#
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#
+# xenBackup - Backup Xen Domains
+#
+#             Version:    1.0:     Created:  John D Quinn, http://www.johnandcailin.com/john
+#
+
+# initialize our variables
+domains="null"                           # the list of domains to backup
+allDomains="null"                        # backup all domains?
+targetLocation="/tmp"                    # the default backup target directory
+mountPoint="/mnt/xen"                    # the mount point to use to mount disk areas
+xenDiskArea="/dev/skx-vg"                # the LVM volume group to use
+shutdownDomains=false                    # don't shutdown domains by default
+quiet=false                              # keep the chatter down
+backupEngine=tar                         # the default backup engine
+rsyncExe=/usr/bin/rsync                  # rsync executable
+rdiffbackupExe=/usr/bin/rdiff-backup     # rdiff-backup executable
+tarExe=/usr/bin/tar                      # tar executable
+xmExe=/usr/sbin/xm                       # xm executable
+purgeAge="null"                          # age at which to purge increments
+globalBackupResult=0                     # success status of overall job
+
+# settings for logging (syslog)
+loggerArgs=""                            # what extra arguments to the logger to use
+loggerTag="xenBackup"                    # the tag for our log statements
+loggerFacility="local3"                  # the syslog facility to log to
+
+# trap user exit and cleanup
+trap 'cleanup;exit 1' 1 2
+
+cleanup()
+{
+   ${logDebug} "Cleaning up"
+   cd / ; umount ${mountPoint}
+
+   # restart the domain
+   if test ${shutdownDomains} = "true"
+   then
+      ${logDebug} "Restarting domain"
+      ${xmExe} create ${domain}.cfg > /dev/null
+   fi
+}
+
+# function to print a usage message and bail
+usageAndBail()
+{
+   cat << EOT
+Usage: xenBackup [OPTION]...
+Backup xen domains to a target area. different backup engines may be specified to
+produce a tarfile, an exact mirror of the disk area or a mirror with incremental backup.
+
+   -d      backup only the specified DOMAINs (comma seperated list)
+   -t      target LOCATION for the backup e.g. /tmp or root@www.example.com:/tmp
+           (not used for tar engine)
+   -a      backup all domains
+   -s      shutdown domains before backup (and restart them afterwards)
+   -q      run in quiet mode, output still goes to syslog
+   -e      backup ENGINE to use, either tar, rsync or rdiff-backup
+   -p      purge increments older than TIME_SPEC. this option only applies
+           to rdiff-backup, e.g. 3W for 3 weeks. see "man rdiff-backup" for
+           more information
+
+Example 1
+   Backup all domains to the /tmp directgory
+   $ xenBackup -a -t /tmp
+
+Example 2
+   Backup domain: "wiki" using rsync to directory /var/xenImages on machine backupServer, 
+   $ xenBackup -e rsync -d wiki -t root@backupServer:/var/xenImages
+
+Example 3
+   Backup domains "domainOne" and "domainTwo" using rdiff-backup purging old increments older than 5 days
+   $ xenBackup -e rdiff-backup -d "domainOne, domainTwo" -p 5D
+
+EOT
+
+   exit 1;
+}
+
+# parse the command line arguments
+while getopts p:e:qsad:t:h o
+do     case "$o" in
+        q)     quiet="true";;
+        s)     shutdownDomains="true";;
+        a)     allDomains="true";;
+        d)     domains="$OPTARG";;
+        t)     targetLocation="$OPTARG";;
+        e)     backupEngine="$OPTARG";;
+        p)     purgeAge="$OPTARG";;
+        h)     usageAndBail;;
+        [?])   usageAndBail
+       esac
+done
+
+# if quiet don't output logging to standard error
+if test ${quiet} = "false"
+then
+   loggerArgs="-s"
+fi
+
+# setup logging subsystem. using syslog via logger
+logCritical="logger -t ${loggerTag} ${loggerArgs} -p ${loggerFacility}.crit"
+logWarning="logger -t ${loggerTag} ${loggerArgs} -p ${loggerFacility}.warning"
+logDebug="logger -t ${loggerTag} ${loggerArgs} -p ${loggerFacility}.debug"
+
+# make sure only root can run our script
+test $(id -u) = 0 || { ${logCritical} "This script must be run as root"; exit 1; }
+
+# make sure that the guest manager is available
+test -x ${xmExe} || { ${logCritical} "xen guest manager (${xmExe}) not found"; exit 1; }
+
+# assemble the list of domains to backup
+if test ${allDomains} = "true"
+then
+   domainList=`${xmExe} list | cut -f1 -d" " | egrep -v "Name|Domain-0"`
+else
+   # make sure we've got some domains specified
+   if test "${domains}" = "null"
+   then
+      usageAndBail
+   fi
+
+   # create the domain list by mapping commas to spaces
+   domainList=`echo ${domains} | tr -d " " | tr , " "`
+fi
+
+# function to do a "rdiff-backup" of domain
+backupDomainUsingrdiff-backup ()
+{
+   domain=$1
+   test -x ${rdiffbackupExe} || { ${logCritical} "rdiff-backup executable (${rdiffbackupExe}) not found"; exit 1; }
+
+   if test ${quiet} = "false"
+   then
+      verbosity="3"
+   else
+      verbosity="0"
+   fi
+
+   targetSubDir=${targetLocation}/${domain}.rdiff-backup.mirror
+
+   # make the targetSubDir if it doesn't already exist
+   mkdir ${targetSubDir} > /dev/null 2>&1
+   ${logDebug} "backing up domain ${domain} to ${targetSubDir} using rdiff-backup"
+
+   # rdiff-backup to the target directory
+   ${rdiffbackupExe} --verbosity ${verbosity} ${mountPoint}/ ${targetSubDir}
+   backupResult=$?
+
+   # purge old increments
+   if test ${purgeAge} != "null"
+   then
+      # purge old increments
+      ${logDebug} "purging increments older than ${purgeAge} from ${targetSubDir}"
+      ${rdiffbackupExe} --verbosity ${verbosity} --force --remove-older-than ${purgeAge} ${targetSubDir}
+   fi
+
+   return ${backupResult}
+}
+
+# function to do a "rsync" backup of domain
+backupDomainUsingrsync ()
+{
+   domain=$1
+   test -x ${rsyncExe} || { ${logCritical} "rsync executable (${rsyncExe}) not found"; exit 1; }
+
+   targetSubDir=${targetLocation}/${domain}.rsync.mirror
+
+   # make the targetSubDir if it doesn't already exist
+   mkdir ${targetSubDir} > /dev/null 2>&1
+   ${logDebug} "backing up domain ${domain} to ${targetSubDir} using rsync"
+
+   # rsync to the target directory
+   ${rsyncExe} -essh -avz --delete ${mountPoint}/ ${targetSubDir}
+   backupResult=$?
+
+   return ${backupResult}
+}
+
+# function to a "tar" backup of domain
+backupDomainUsingtar ()
+{
+   domain=$1
+
+   # make sure we can write to the target directory
+   test -w ${targetLocation} || { ${logCritical} "target directory (${targetLocation}) is not writeable"; exit 1; }
+
+   targetFile=${targetLocation}/${domain}.`date '+%d%b%y'`.$$.tar.gz
+   ${logDebug} "backing up domain ${domain} to ${targetFile} using tar"
+
+   # tar to the target directory
+   cd ${mountPoint}
+
+   ${tarExe} pcfz ${targetFile} * > /dev/null
+   backupResult=$?
+
+   return ${backupResult}
+}
+
+# backup the specified domains
+for domain in ${domainList}
+do
+   ${logDebug} "backing up domain: ${domain}"
+
+   # make sure that the domain is shutdown if required
+   if test ${shutdownDomains} = "true"
+   then
+      ${logDebug} "shutting down domain ${domain}"
+      ${xmExe} shutdown -w ${domain} > /dev/null
+   fi
+
+   # unmount mount point if already mounted
+   umount ${mountPoint} > /dev/null 2>&1
+
+   # mount the xen disk read-only
+   xenDisk=${xenDiskArea}/${domain}-disk
+   test -r ${xenDisk} || { ${logCritical} "xen disk area not readable. are you sure that the domain \"${domain}\" exists?"; exit 1; }
+   ${logDebug} "Mounting ${xenDisk} read-only"
+   mount -r ${xenDisk} ${mountPoint} || { ${logCritical} "mount failed, does mount point (${mountPoint}) exist?"; exit 1; }
+
+   # do the backup according to the chosen backup engine
+   backupDomainUsing${backupEngine} ${domain}
+
+   # make sure that the backup was successful
+   if test $? -ne 0
+   then
+      ${logCritical} "FAILURE: error backing up domain ${domain}"
+      globalBackupResult=1
+   else
+      ${logDebug} "SUCCESS: domain ${domain} backed up"
+   fi
+      
+   # clean up
+   cleanup;
+done
+
+if test ${globalBackupResult} -eq 0
+then
+   ${logDebug} "SUCCESS: backup of all domains completed successfully"
+else
+   ${logCritical} "FAILURE: backup completed with some failures"
+fi
+
+exit ${globalBackupResult}

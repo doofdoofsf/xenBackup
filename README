@@ -1,0 +1,4 @@
+xenBackup is a simple script to implement a xen backup strategy. it automates the backup of single or multiple xen guests using one of three backup methods, tar, rsync or rdiff-backup.
+
+for more information:
+$ ./xenBackup -h
