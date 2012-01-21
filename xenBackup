@@ -19,21 +19,27 @@
 # xenBackup - Backup Xen Domains
 #
 #             Version:    1.0:     Created:  John D Quinn, http://www.johnandcailin.com/john
+#                         1.1:     Added snapshot functionality:  Henare Degan
+#                         1.2:     Added ownmountPoint directive: Tim Corcoran
+#                         1.2.1:   Simplified ownmountPoint directive: Andrew Perry
 #
 
 # initialize our variables
 domains="null"                           # the list of domains to backup
 allDomains="null"                        # backup all domains?
 targetLocation="/tmp"                    # the default backup target directory
-mountPoint="/mnt/xen"                    # the mount point to use to mount disk areas
+basemountPoint="/mnt/xen"                # the base mount point to use to mount disk areas
+ownmountPoint="1"                        # use own mount point for each domain to avoid "cross-contamination"
 xenDiskArea="/dev/skx-vg"                # the LVM volume group to use
 shutdownDomains=false                    # don't shutdown domains by default
 quiet=false                              # keep the chatter down
-backupEngine=tar                         # the default backup engine
+backupEngine=rdiff-backup                # the default backup engine
 rsyncExe=/usr/bin/rsync                  # rsync executable
 rdiffbackupExe=/usr/bin/rdiff-backup     # rdiff-backup executable
 tarExe=/usr/bin/tar                      # tar executable
 xmExe=/usr/sbin/xm                       # xm executable
+lvcreateExe=/sbin/lvcreate               # lvcreate executable
+lvremoveExe=/sbin/lvremove               # lvremove executable
 purgeAge="null"                          # age at which to purge increments
 globalBackupResult=0                     # success status of overall job
 
@@ -48,14 +54,11 @@ trap 'cleanup;exit 1' 1 2
 cleanup()
 {
    ${logDebug} "Cleaning up"
-   cd / ; umount ${mountPoint}
+   cd /
+   umount ${mountPoint} || { ${logCritical} "umount of ${mountPoint} failed"; exit 1; }
 
-   # restart the domain
-   if test ${shutdownDomains} = "true"
-   then
-      ${logDebug} "Restarting domain"
-      ${xmExe} create ${domain}.cfg > /dev/null
-   fi
+   ${logDebug} "Removing snapshot ${xenDisk}-snap"
+   ${lvremoveExe} -f ${xenDisk}-snap || { ${logCritical} "removal of snapshot ${xenDisk}-snap failed"; exit 1; }
 }
 
 # function to print a usage message and bail
@@ -78,11 +81,11 @@ produce a tarfile, an exact mirror of the disk area or a mirror with incremental
            more information
 
 Example 1
-   Backup all domains to the /tmp directgory
+   Backup all domains to the /tmp directory
    $ xenBackup -a -t /tmp
 
 Example 2
-   Backup domain: "wiki" using rsync to directory /var/xenImages on machine backupServer, 
+   Backup domain: "wiki" using rsync to directory /var/xenImages on machine backupServer,
    $ xenBackup -e rsync -d wiki -t root@backupServer:/var/xenImages
 
 Example 3
@@ -219,6 +222,19 @@ for domain in ${domainList}
 do
    ${logDebug} "backing up domain: ${domain}"
 
+   # set the mountpoint based on the basemountPoint and ownmountPoint directives
+   if [ "$ownmountPoint" = "1" ]
+   then
+      mountPoint=${basemountPoint}/${domain}
+      ${logDebug} "using ownmountPoint so setting mountpoint to: ${basemountPoint}/${domain}"
+     
+      # make the mountPoint directory
+      mkdir "$mountPoint" > /dev/null 2>&1 
+   else
+      mountPoint=${basemountPoint}
+      ${logDebug} "setting mountpoint to: ${basemountPoint}"
+   fi
+
    # make sure that the domain is shutdown if required
    if test ${shutdownDomains} = "true"
    then
@@ -229,11 +245,24 @@ do
    # unmount mount point if already mounted
    umount ${mountPoint} > /dev/null 2>&1
 
-   # mount the xen disk read-only
+   # check if the disk actually exists
    xenDisk=${xenDiskArea}/${domain}-disk
    test -r ${xenDisk} || { ${logCritical} "xen disk area not readable. are you sure that the domain \"${domain}\" exists?"; exit 1; }
-   ${logDebug} "Mounting ${xenDisk} read-only"
-   mount -r ${xenDisk} ${mountPoint} || { ${logCritical} "mount failed, does mount point (${mountPoint}) exist?"; exit 1; }
+   
+   # snapshot the disk
+   ${logDebug} "Making a snapshot of ${xenDisk}"
+   ${lvcreateExe} -s -L 5G -n ${xenDisk}-snap ${xenDisk} || { ${logCritical} "snapshot failed, does LV (${xenDisk}) exist?"; exit 1; }
+
+   # restart the domain
+   if test ${shutdownDomains} = "true"
+   then
+      ${logDebug} "Restarting domain"
+      ${xmExe} create ${domain}.cfg > /dev/null
+   fi
+
+   # mount the xen snapshot read-only
+   ${logDebug} "Mounting ${xenDisk}-snap read-only"
+   mount -r ${xenDisk}-snap ${mountPoint} || { ${logCritical} "mount failed, does mount point (${mountPoint}) exist?"; exit 1; }
 
    # do the backup according to the chosen backup engine
    backupDomainUsing${backupEngine} ${domain}
@@ -246,7 +275,7 @@ do
    else
       ${logDebug} "SUCCESS: domain ${domain} backed up"
    fi
-      
+
    # clean up
    cleanup;
 done
