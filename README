@@ -2,3 +2,5 @@ xenBackup is a simple script to implement a xen backup strategy. it automates th
 
 for more information:
 $ ./xenBackup -h
+
+Read more about this utility on the blog here: http://www.johnandcailin.com/blog/john/backing-your-xen-domains
